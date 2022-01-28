@@ -1,0 +1,154 @@
+1.
+
+CREATE OR REPLACE FUNCTION reorders_func() 
+RETURNS TRIGGER AS
+$$
+DECLARE
+    ilosc INTEGER;
+    query text;
+    rec RECORD;
+    message text;
+BEGIN
+    DELETE FROM reorders;
+    ilosc:= 0;
+    query:='SELECT item_id, quantity, description 
+    FROM item JOIN stock USING (item_id)
+    WHERE quantity< $1'; 
+    
+    FOR rec IN EXECUTE query USING 4 
+    LOOP
+        IF rec.quantity = 0 THEN
+            message:='brak';  
+        ELSE
+            message:='Zostalo jeszcze ' || rec.quantity || ' sztuk ' || rec.description;
+        END IF;
+        EXECUTE 'INSERT INTO reorders(item_id, message) values('|| rec.item_id ||',$1)' USING message;
+        ilosc:= ilosc+1;
+    END LOOP;
+    
+    RETURN NULL;
+
+END;
+$$ LANGUAGE plpgsql;  
+
+
+CREATE TRIGGER update_reorders AFTER INSERT OR UPDATE OR DELETE ON stock
+FOR EACH ROW EXECUTE PROCEDURE reorders_func();
+
+2.
+
+CREATE OR REPLACE FUNCTION integralnosc_danych() RETURNS TRIGGER AS 
+$$
+DECLARE
+    orders RECORD;
+BEGIN
+    SELECT COUNT(*) as licznik INTO orders FROM orderinfo WHERE customer_id = OLD.customer_id AND date_shipped IS NULL GROUP BY customer_id;
+    IF orders.licznik THEN
+        RETURN NULL;
+    END IF;
+    
+    DELETE FROM orderline WHERE orderinfo_id IN (SELECT orderinfo_id FROM orderinfo WHERE customer_id = OLD.customer_id);
+    DELETE FROM orderinfo WHERE customer_id = OLD.customer_id;
+    RETURN OLD;
+END 
+$$LANGUAGE 'plpgsql';
+
+CREATE TRIGGER trig_iteralnosc BEFORE DELETE ON customer FOR EACH ROW
+EXECUTE PROCEDURE integralnosc_danych();
+
+3.
+
+CREATE or REPLACE FUNCTION magazyn_reklamowy() RETURNS TRIGGER AS 
+$$
+DECLARE
+    ord_row RECORD;
+    cust_row RECORD;
+BEGIN
+    IF NEW.description LIKE '%Magazyn%' THEN
+        FOR cust_row IN
+            SELECT customer_id FROM customer
+        LOOP
+            INSERT INTO orderinfo VALUES (DEFAULT, cust_row.customer_id, NOW(), NULL, 0.0);
+            SELECT MAX(orderinfo_id) as id INTO ord_row FROM orderinfo;
+            INSERT INTO orderline VALUES (ord_row.id, NEW.item_id, 1);
+        END LOOP;
+    END IF;
+    RETURN NEW;
+END
+$$LANGUAGE 'plpgsql';
+
+CREATE TRIGGER trig_magazyn_rek AFTER INSERT ON item FOR EACH ROW
+EXECUTE PROCEDURE magazyn_reklamowy();
+
+
+4.
+
+CREATE OR REPLACE FUNCTION discount_fun() RETURNS TRIGGER AS 
+$$
+DECLARE
+    orders RECORD;
+BEGIN
+    SELECT COUNT(*) as licznik INTO orders FROM orderinfo WHERE customer_id= NEW.customer_id;
+    IF orders.licznik % 10 =0 THEN
+        UPDATE customer SET discount= discount + 0.02 WHERE customer_id= NEW.customer_id;
+    END IF;
+
+    RETURN NEW;
+END 
+$$LANGUAGE 'plpgsql';
+
+CREATE TRIGGER trig_discount_fun AFTER INSERT ON orderinfo FOR EACH ROW
+EXECUTE PROCEDURE discount_fun();
+
+
+5.
+
+CREATE OR REPLACE FUNCTION bezplatna_dostawa() RETURNS TRIGGER AS 
+$$
+DECLARE
+    order_date DATE;
+BEGIN
+    SELECT date_placed INTO order_date FROM orderinfo WHERE orderinfo_id= NEW.orderinfo_id LIMIT 1;
+    IF DATE_PART('day', now()::timestamp - order_date::timestamp) > 3 THEN 
+        UPDATE orderinfo SET shipping= 0.00 WHERE orderinfo_id= NEW.orderinfo_id;
+    END IF; 
+    RETURN NEW;
+END
+$$LANGUAGE 'plpgsql';
+
+
+CREATE TRIGGER trig_bezpl_dostawa BEFORE UPDATE ON orderinfo
+FOR EACH ROW EXECUTE PROCEDURE bezplatna_dostawa();
+
+6.
+
+CREATE or REPLACE FUNCTION maksymalna_ilosc() RETURNS TRIGGER AS 
+$$
+DECLARE
+    zamowienie_il INT;
+    ord_row RECORD;
+    ilosc INT;
+    new_order_id INT;
+BEGIN
+   zamowienie_il := NEW.quantity;
+    IF zamowienie_il > 10 THEN
+        SELECT * FROM orderinfo INTO ord_row WHERE orderinfo_id= NEW.orderinfo_id;
+        WHILE zamowienie_il != 0 LOOP
+            ilosc :=zamowienie_il;
+            IF zamowienie_il > 10 THEN 
+                ilosc= 10;
+                INSERT INTO orderinfo VALUES (DEFAULT, ord_row.customer_id, NOW(), NULL, ord_row.shipping);
+                SELECT orderinfo_id INTO new_order_id FROM orderinfo ORDER BY orderinfo_id DESC LIMIT 1;
+                INSERT INTO orderline VALUES (new_order_id, NEW.item_id, ilosc);
+            ELSE
+                NEW.quantity= ilosc;
+            END IF;
+           zamowienie_il= zamowienie_il - ilosc;
+        END LOOP;
+    END IF;
+    RETURN NEW;
+END
+$$LANGUAGE 'plpgsql';
+
+CREATE TRIGGER trig_maks_ilsoc BEFORE INSERT ON orderline FOR EACH ROW
+EXECUTE PROCEDURE maksymalna_ilosc();
